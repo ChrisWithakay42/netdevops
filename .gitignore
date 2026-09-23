@@ -1,0 +1,21 @@
+# Raw firewall exports contain live secrets (password hashes, CARP/HA-sync
+# passwords, private keys). Only the sanitized copies are committed.
+exports/raw/
+*.xml
+!exports/sanitized/*.xml
+!tests/fixtures/*.xml
+
+# Credentials / local env
+.env
+*.vault
+vault-pass*
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+
+# OS
+.DS_Store
+*.egg-info/
