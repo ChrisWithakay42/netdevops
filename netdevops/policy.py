@@ -51,6 +51,7 @@ class PolicyEvaluator:
         self._self_ips = (
             {interface.address for interface in intent.interfaces if interface.address}
             | set(intent.vips)
+            | {str(ipaddress.ip_interface(vip.address).ip) for vip in intent.virtual_ips}
             | {"127.0.0.1"}
         )
 
@@ -71,8 +72,16 @@ class PolicyEvaluator:
         if token.endswith("ip") and token[:-2] in self._interfaces:
             return address == self._interfaces[token[:-2]].address
         if token in self._interfaces:
-            cidr = self._interfaces[token].cidr
-            return bool(cidr) and parsed_address in ipaddress.ip_network(cidr)
+            # pf's (if:network) covers every address on the interface, IP-alias
+            # VIPs included (verified on 26.7: (vlan0.50:network:2))
+            networks = [
+                ipaddress.ip_interface(vip.address).network
+                for vip in self.intent.virtual_ips
+                if vip.interface == token
+            ]
+            if self._interfaces[token].cidr:
+                networks.append(ipaddress.ip_network(self._interfaces[token].cidr))
+            return any(parsed_address in network for network in networks)
         alias = self.intent.alias(token)
         if alias is not None:
             return any(

@@ -40,3 +40,26 @@ def test_multi_network_source_matches_any_listed_network():
     evaluator = PolicyEvaluator(intent)
     assert evaluator.evaluate(Packet("opt1", "10.0.2.5", "1.1.1.1", "tcp", 443)).allowed
     assert not evaluator.evaluate(Packet("opt1", "10.0.9.5", "1.1.1.1", "tcp", 443)).allowed
+
+
+def test_interface_net_includes_virtual_ip_subnets():
+    # pf's (if:network) covers every address on the interface; verified live
+    # on 26.7 as (vlan0.50:network:2) after adding a /24 VIP
+    from netdevops.models import Intent, Interface, Rule, VirtualIP
+    from netdevops.policy import Packet, PolicyEvaluator
+
+    intent = Intent(
+        interfaces=[Interface(token="opt2", cidr="192.168.20.0/27", address="192.168.20.1")],
+        virtual_ips=[
+            VirtualIP(address="10.20.20.1/24", interface="opt2"),
+            VirtualIP(address="10.20.0.53/32", interface="lo0"),
+        ],
+        rules=[Rule(
+            description="out", interface=["opt2"], sequence=1, action="pass",
+            source_net="opt2", destination_port="443", log=True,
+        )],
+    )
+    evaluator = PolicyEvaluator(intent)
+    assert evaluator.evaluate(Packet("opt2", "10.20.20.10", "1.1.1.1", "tcp", 443)).allowed
+    assert evaluator.evaluate(Packet("opt2", "192.168.20.5", "1.1.1.1", "tcp", 443)).allowed
+    assert not evaluator.evaluate(Packet("opt2", "10.30.0.1", "1.1.1.1", "tcp", 443)).allowed
