@@ -66,6 +66,7 @@ class FakeFirewall:
             return {
                 "mode": payload["mode"], "interface": payload["interface"],
                 "subnet": address, "subnet_bits": bits, "descr": payload["descr"],
+                "nobind": payload.get("nobind", "0"),
             }
         if kind == "alias":
             return dict(payload, content=payload["content"].replace("\n", ","))
