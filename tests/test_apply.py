@@ -449,3 +449,22 @@ def test_writes_that_did_not_land_as_intended_are_rolled_back_not_activated():
         apply(firewall, Intent(virtual_ips=[DNS_VIP]))
     assert firewall.store["vip"] == {}
     assert activated(firewall) == []
+
+
+def test_alias_traffic_counters_are_not_a_live_change():
+    firewall = FakeFirewall()
+    firewall.store["alias"]["12121212-1212-4212-8212-121212121212"] = {
+        "enabled": "1", "name": "DNS_SERVER", "type": "host", "content": "192.168.30.5",
+        "description": "", "eval_match": "1", "in_pass_p": "10",
+    }
+
+    def traffic(fw):
+        row = fw.store["alias"]["12121212-1212-4212-8212-121212121212"]
+        row["eval_match"], row["in_pass_p"] = "2", "99"
+
+    intent = Intent(
+        aliases=[Alias(name="DNS_SERVER", type="host", content=["192.168.30.5"])],
+        virtual_ips=[DNS_VIP],
+    )
+    apply(firewall, intent, between_plan_and_apply=traffic)
+    assert activated(firewall) == ["reconfigure_vips"]

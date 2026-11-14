@@ -60,10 +60,25 @@ class LiveState:
         ]
 
 
+# Live alias statistics: they change on every read and are not configuration.
+VOLATILE_ALIAS_FIELDS = {
+    "current_items", "last_updated", "eval_match", "eval_nomatch",
+    "in_block_b", "in_block_p", "in_pass_b", "in_pass_p",
+    "out_block_b", "out_block_p", "out_pass_b", "out_pass_p",
+}
+
+
 def fetch_live(client) -> LiveState:
     raw_rules, raw_snat = client.get_filter_model()
     return LiveState(
-        aliases={uuid: flatten_row(row) for uuid, row in client.get_aliases().items()},
+        aliases={
+            uuid: {
+                field_name: value
+                for field_name, value in flatten_row(row).items()
+                if field_name not in VOLATILE_ALIAS_FIELDS
+            }
+            for uuid, row in client.get_aliases().items()
+        },
         rules={uuid: flatten_row(row) for uuid, row in raw_rules.items()},
         snat={uuid: flatten_row(row) for uuid, row in raw_snat.items()},
         vips=diff_mod.live_vip_rows(
