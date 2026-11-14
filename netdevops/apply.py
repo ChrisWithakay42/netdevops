@@ -154,24 +154,42 @@ def _check(client, intent, before, journal, echo) -> None:
 
 
 def _rollback(client, before, journal, echo) -> list[str]:
+    """Undo in reverse dependency order: per kind, restore updates, then delete
+    creates, so a rule stops referencing a new alias before the alias goes."""
     failures = []
     for kind in reversed(KINDS):
+        for update_kind, change in reversed(journal.updated):
+            if update_kind != kind:
+                continue
+            try:
+                payload = _restore_payload(kind, change, before.of(kind)[change.uuid])
+                getattr(client, f"set_{kind}")(change.uuid, payload)
+                echo(f"rolled back update {kind}: {change.label}")
+            except Exception as error:  # keep going: undo as much as possible
+                failures.append(f"restore {kind} {change.label}: {error}")
         for uuid in sorted(journal.created[kind]):
             try:
                 getattr(client, f"del_{kind}")(uuid)
                 echo(f"rolled back create {kind} {uuid}")
-            except Exception as error:  # keep going: undo as much as possible
+            except Exception as error:
                 failures.append(f"delete {kind} {uuid}: {error}")
-    for kind, change in reversed(journal.updated):
-        try:
-            payload = _restore_payload(kind, change, before.of(kind)[change.uuid])
-            getattr(client, f"set_{kind}")(change.uuid, payload)
-            echo(f"rolled back update {kind}: {change.label}")
-        except Exception as error:
-            failures.append(f"restore {kind} {change.label}: {error}")
     for kind in KINDS:
         for uuid in sorted(journal.deleted[kind]):
             failures.append(f"pruned {kind} {uuid} is gone; restore it from the backup")
+    # An add the firewall saved but whose reply never reached us (Ctrl-C,
+    # timeout) isn't in the journal. Report it; it can't be told apart from a
+    # concurrent GUI edit, so it is not deleted.
+    try:
+        now = fetch_live(client)
+    except Exception as error:
+        return failures + [f"could not re-read live state after rollback: {error}"]
+    for kind in KINDS:
+        unrecorded = set(now.of(kind)) - set(before.of(kind)) - journal.created[kind]
+        if unrecorded:
+            failures.append(
+                f"unrecorded new {kind} object(s) {sorted(unrecorded)} are saved; "
+                "check them in the GUI before the next filter reload"
+            )
     return failures
 
 
@@ -206,9 +224,12 @@ def run_apply(
     try:
         _write(client, plan, prune, journal, echo)
         _check(client, intent, before, journal, echo)
-    except Exception as error:
+    except BaseException as error:  # Ctrl-C too: never leave a half-written config saved
         failures = _rollback(client, before, journal, echo)
         detail = "; ".join(failures) if failures else "all writes undone"
+        if not isinstance(error, Exception):
+            echo(f"interrupted; rolled back this run's writes ({detail})")
+            raise
         raise ApplyAborted(
             f"{error}. Nothing activated; rolled back this run's writes ({detail})"
         ) from error

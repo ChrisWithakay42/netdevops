@@ -38,6 +38,7 @@ class FakeFirewall:
         self.counter = 0
         self.after_write = None  # hook to simulate firewall misbehaviour
         self.fail_on = None  # method name that raises
+        self.fail_with = WriteGuardError
 
     def _new_uuid(self):
         self.counter += 1
@@ -57,7 +58,7 @@ class FakeFirewall:
     def _record(self, name):
         self.calls.append(name)
         if self.fail_on == name:
-            raise WriteGuardError(f"simulated failure in {name}")
+            raise self.fail_with(f"simulated failure in {name}")
 
     def _row(self, kind, payload):
         if kind == "vip":
@@ -289,3 +290,73 @@ def test_no_backup_no_writes():
     with pytest.raises(OSError):
         apply(firewall, Intent(rules=[RULE]), backup=failing_backup)
     assert firewall.store["rule"] == {}
+
+
+def test_ctrl_c_during_writes_still_rolls_back():
+    firewall = FakeFirewall()
+    firewall.fail_on, firewall.fail_with = "add_rule", KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        apply(firewall, Intent(virtual_ips=[DNS_VIP], rules=[RULE]))
+    assert firewall.store["vip"] == {}
+    assert firewall.store["rule"] == {}
+    assert activated(firewall) == []
+
+
+def test_object_saved_but_unrecorded_is_reported_not_silently_left():
+    # Ctrl-C after the firewall saved the rule but before its uuid came back
+    firewall = FakeFirewall()
+    messages = []
+
+    def interrupt(fw):
+        if fw.store["rule"]:
+            raise KeyboardInterrupt
+
+    firewall.after_write = interrupt
+    live = fetch_live(firewall)
+    intent = Intent(rules=[RULE])
+    with pytest.raises(KeyboardInterrupt):
+        run_apply(
+            firewall, intent, plan_from_live(intent, live), live, prune=False,
+            backup=lambda: None, echo=messages.append,
+        )
+    assert any("unrecorded" in message for message in messages)
+    assert activated(firewall) == []
+
+
+def test_rollback_restores_references_before_deleting_aliases():
+    from netdevops.models import SnatRule
+
+    firewall = FakeFirewall()
+    rule_uuid = "99999999-9999-4999-8999-999999999999"
+    live_rule = {
+        "enabled": "1", "sequence": "100", "action": "pass", "quick": "1",
+        "interface": "lan", "direction": "in", "ipprotocol": "inet", "protocol": "TCP",
+        "source_net": "any", "source_not": "0", "source_port": "",
+        "destination_net": "any", "destination_not": "0", "destination_port": "443",
+        "log": "0", "description": "Allow web",
+    }
+    firewall.store["rule"][rule_uuid] = dict(live_rule)
+    original_del = firewall._del
+
+    def del_refusing_in_use(kind, uuid):
+        if kind == "alias":
+            name = fw_name = firewall.store["alias"][uuid]["name"]
+            in_use = any(
+                fw_name in (row.get("source_net"), row.get("destination_net"))
+                for row in firewall.store["rule"].values()
+            )
+            if in_use:
+                raise WriteGuardError(f"alias {name} in use")
+        original_del(kind, uuid)
+
+    firewall._del = del_refusing_in_use
+    firewall.fail_on = "add_snat"
+    intent = Intent(
+        aliases=[Alias(name="WEB_SERVERS", type="host", content=["10.20.0.80"])],
+        rules=[RULE.model_copy(update={"destination_net": "WEB_SERVERS"})],
+        snat_rules=[SnatRule(description="NAT", interface="wan", sequence=1, target="wanip")],
+    )
+    with pytest.raises(ApplyAborted, match="all writes undone"):
+        apply(firewall, intent)
+    assert firewall.store["alias"] == {}
+    assert firewall.store["rule"][rule_uuid]["destination_net"] == "any"

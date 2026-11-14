@@ -70,3 +70,17 @@ def test_unflagged_any_any_pass_rule_rejected_offline():
         Intent(rules=[rule])
     Intent(rules=[rule.model_copy(update={"allow_any_any": True})])
     Intent(rules=[rule.model_copy(update={"enabled": False})])
+
+
+def test_any_any_check_resolves_intent_aliases():
+    import pytest
+
+    from netdevops.models import Alias, Intent, Rule
+
+    everything = Alias(name="EVERYTHING", type="network", content=["0.0.0.0/0"])
+    rule = Rule(
+        description="sneaky", interface=["lan"], sequence=1, action="pass",
+        destination_net="EVERYTHING",
+    )
+    with pytest.raises(ValueError, match="any -> any"):
+        Intent(aliases=[everything], rules=[rule])

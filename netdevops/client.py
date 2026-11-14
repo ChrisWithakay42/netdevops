@@ -205,15 +205,21 @@ class OPNsenseClient:
 
     # -- activation -------------------------------------------------------
 
+    def _activate(self, path: str) -> None:
+        data = self._post(path)
+        status = str(data.get("status", "")) if isinstance(data, dict) else ""
+        if status.strip().lower() != "ok":
+            raise RuntimeError(f"{path}: activation not confirmed, reply {data!r}")
+
     def reconfigure_aliases(self) -> None:
-        self._post("/api/firewall/alias/reconfigure")
+        self._activate("/api/firewall/alias/reconfigure")
 
     def reconfigure_vips(self) -> None:
-        self._post("/api/interfaces/vip_settings/reconfigure")
+        self._activate("/api/interfaces/vip_settings/reconfigure")
 
     def apply_filter(self) -> None:
         """Load the saved filter + source NAT rules into pf."""
-        self._post("/api/firewall/filter/apply")
+        self._activate("/api/firewall/filter/apply")
 
     # -- backup -----------------------------------------------------------
 

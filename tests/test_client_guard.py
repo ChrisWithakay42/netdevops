@@ -148,3 +148,14 @@ def test_tls_verification_is_on_by_default(monkeypatch):
 
     monkeypatch.delenv("OPNSENSE_SSL_VERIFY", raising=False)
     assert _ssl_verify_from_env() is True
+
+
+@pytest.mark.parametrize(
+    "method", ["reconfigure_aliases", "reconfigure_vips", "apply_filter"]
+)
+def test_activation_must_report_ok(method):
+    client, _ = make_client({}, post_reply={"status": "failed"})
+    with pytest.raises(RuntimeError):
+        getattr(client, method)()
+    client, _ = make_client({}, post_reply={"status": "OK\n\n"})
+    getattr(client, method)()
