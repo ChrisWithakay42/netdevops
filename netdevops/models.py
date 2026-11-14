@@ -163,7 +163,11 @@ class Intent(BaseModel):
         return next((alias for alias in self.aliases if alias.name == name), None)
 
     def _valid_net(self, value: str) -> bool:
-        return value in BUILTIN_NETS or self.alias(value) is not None or is_cidr(value)
+        """A single token, or (26.x) a comma-separated list of them."""
+        return all(
+            token in BUILTIN_NETS or self.alias(token) is not None or is_cidr(token)
+            for token in value.split(",")
+        )
 
     @model_validator(mode="after")
     def _cross_checks(self) -> Intent:
@@ -174,7 +178,9 @@ class Intent(BaseModel):
             errors.append(f"duplicate alias name {duplicate!r}")
 
         seen_match_keys: set[tuple[str, str]] = set()
-        sequence_owners: dict[int, str] = {}
+        # OPNsense allows the same sequence on different interfaces; only a
+        # clash on a shared interface makes the order ambiguous.
+        sequence_owners: dict[tuple[str, int], str] = {}
         for rule in self.rules:
             label = f"rule '{rule.description}'"
             for interface_name in rule.interface:
@@ -184,12 +190,14 @@ class Intent(BaseModel):
                         f"{label}: duplicate (interface={interface_name}, description) match key"
                     )
                 seen_match_keys.add(match_key)
-            if rule.sequence in sequence_owners:
-                errors.append(
-                    f"{label}: sequence {rule.sequence} already used by "
-                    f"'{sequence_owners[rule.sequence]}'"
-                )
-            sequence_owners[rule.sequence] = rule.description
+            for interface_name in rule.interface:
+                owner = sequence_owners.get((interface_name, rule.sequence))
+                if owner is not None:
+                    errors.append(
+                        f"{label}: sequence {rule.sequence} already used by '{owner}' "
+                        f"on {interface_name}"
+                    )
+                sequence_owners[(interface_name, rule.sequence)] = rule.description
 
             for field_name in ("source_net", "destination_net"):
                 value = getattr(rule, field_name)
@@ -232,8 +240,8 @@ class Intent(BaseModel):
                 rule.enabled
                 and rule.action == "pass"
                 and not rule.allow_any_any
-                and rule.source_net in means_any
-                and rule.destination_net in means_any
+                and means_any & set(rule.source_net.split(","))
+                and means_any & set(rule.destination_net.split(","))
                 and not rule.source_invert
                 and not rule.destination_invert
                 and rule.destination_port in ("", "any", "1:65535", "0:65535")

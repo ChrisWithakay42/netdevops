@@ -50,8 +50,8 @@ def pass_all_rules(
         if (
             row.get("enabled") == "1"
             and row.get("action") == "pass"
-            and row.get("source_net", "any") in means_any
-            and row.get("destination_net", "any") in means_any
+            and means_any & set(row.get("source_net", "any").split(","))
+            and means_any & set(row.get("destination_net", "any").split(","))
             and row.get("source_not", "0") != "1"
             and row.get("destination_not", "0") != "1"
             and row.get("destination_port", "") in ANY_PORTS

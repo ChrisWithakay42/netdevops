@@ -21,3 +21,22 @@ def test_deny_rules_are_logged(intent):
         if rule.enabled and rule.action in ("block", "reject") and not rule.log
     ]
     assert not unlogged_denies, [rule.description for rule in unlogged_denies]
+
+
+def test_multi_network_source_matches_any_listed_network():
+    from netdevops.models import Intent, Interface, Rule
+    from netdevops.policy import Packet, PolicyEvaluator
+
+    intent = Intent(
+        interfaces=[
+            Interface(token="lan", cidr="10.0.1.0/24", address="10.0.1.1"),
+            Interface(token="opt1", cidr="10.0.2.0/24", address="10.0.2.1"),
+        ],
+        rules=[Rule(
+            description="multi", interface=["opt1"], sequence=1, action="pass",
+            source_net="lan,opt1", destination_port="443", log=True,
+        )],
+    )
+    evaluator = PolicyEvaluator(intent)
+    assert evaluator.evaluate(Packet("opt1", "10.0.2.5", "1.1.1.1", "tcp", 443)).allowed
+    assert not evaluator.evaluate(Packet("opt1", "10.0.9.5", "1.1.1.1", "tcp", 443)).allowed

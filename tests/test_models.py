@@ -84,3 +84,19 @@ def test_any_any_check_resolves_intent_aliases():
     )
     with pytest.raises(ValueError, match="any -> any"):
         Intent(aliases=[everything], rules=[rule])
+
+
+def test_same_sequence_on_different_interfaces_is_allowed():
+    Intent(rules=[
+        Rule(**_rule(destination_port="443")),
+        Rule(**_rule(description="other", interface=["opt1"], destination_port="443")),
+    ])
+
+
+def test_multi_network_fields_accepted_and_each_token_checked():
+    admin = Alias(name="Admin_PC", type="mac", content=[])
+    admin_rule = Rule(**_rule(source_net="Admin_PC,opt5", destination_port="22"))
+    Intent(aliases=[admin], rules=[admin_rule])
+    Intent(rules=[Rule(**_rule(destination_net="(self),opt4", destination_port="179"))])
+    with pytest.raises(pydantic.ValidationError, match="nope"):
+        Intent(rules=[Rule(**_rule(destination_net="lan,nope", destination_port="1"))])

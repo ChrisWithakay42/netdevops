@@ -116,3 +116,9 @@ def test_duplicate_live_key_matched_by_intent_fails():
 def test_duplicate_live_keys_not_in_intent_are_both_live_only():
     plan = plan_for(Intent(), live_rules={"u1": LIVE_RULE, "u2": dict(LIVE_RULE)})
     assert sorted(change.uuid for change in plan.unmanaged) == ["u1", "u2"]
+
+
+def test_multi_network_order_is_not_a_change():
+    rule = RULE.model_copy(update={"destination_net": "lan,opt2"})
+    live = dict(LIVE_RULE, destination_net="opt2,lan")
+    assert plan_for(Intent(rules=[rule]), live_rules={"u1": live}).empty

@@ -114,7 +114,7 @@ def _changed_fields(payload: dict, live_row: dict) -> list[str]:
     changed = []
     for field_name, desired_value in payload.items():
         live_value = live_row.get(field_name, "")
-        if field_name == "interface":
+        if field_name in ("interface", "source_net", "destination_net"):
             if set(desired_value.split(",")) != set(live_value.split(",")):
                 changed.append(field_name)
         elif field_name == "content":

@@ -61,6 +61,8 @@ class PolicyEvaluator:
         return (not result) if invert else result
 
     def _net_contains_plain(self, token: str, address: str) -> bool:
+        if "," in token:  # 26.x multi-network field: any listed network matches
+            return any(self._net_contains_plain(part, address) for part in token.split(","))
         parsed_address = ipaddress.ip_address(address)
         if token == "any":
             return True
