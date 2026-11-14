@@ -55,3 +55,31 @@ def test_pass_all_exemption_needs_matching_interface_set():
     live = {"a": PASS_ALL | {"description": "Owner-approved any-any"}}
     approved = {("Owner-approved any-any", frozenset({"lan"}))}
     assert pass_all_rules(live, allowed=approved) == ["a"]
+
+
+def test_pass_all_catches_spelled_out_any_and_full_port_ranges():
+    variants = {
+        "v4": PASS_ALL | {"source_net": "0.0.0.0/0"},
+        "v6": PASS_ALL | {"destination_net": "::/0"},
+        "port_any": PASS_ALL | {"destination_port": "any"},
+        "port_range": PASS_ALL | {"destination_port": "1:65535"},
+        "port_zero": PASS_ALL | {"destination_port": "0:65535"},
+    }
+    assert sorted(pass_all_rules(variants, allowed=set())) == sorted(variants)
+
+
+def test_pass_all_resolves_aliases_that_mean_everything():
+    live = {"a": PASS_ALL | {"destination_net": "EVERYTHING"}}
+    assert pass_all_rules(live, allowed=set(), any_aliases={"EVERYTHING"}) == ["a"]
+    assert pass_all_rules(live, allowed=set()) == []
+
+
+def test_any_aliases_found_from_alias_content():
+    from netdevops.safety import any_aliases
+
+    live_aliases = {
+        "u1": {"name": "EVERYTHING", "type": "network", "content": "10.0.0.0/8,0.0.0.0/0"},
+        "u2": {"name": "LAN_NETS", "type": "network", "content": "10.0.0.0/8"},
+        "u3": {"name": "PORTS", "type": "port", "content": "0.0.0.0/0"},
+    }
+    assert any_aliases(live_aliases) == {"EVERYTHING"}

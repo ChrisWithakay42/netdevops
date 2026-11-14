@@ -1,8 +1,6 @@
 # Raw firewall exports contain live secrets (password hashes, CARP/HA-sync
-# passwords, private keys). Only the sanitized copies are committed.
-exports/raw/
+# passwords, private keys). Never commit an export to the engine repo.
 *.xml
-!exports/sanitized/*.xml
 !tests/fixtures/*.xml
 
 # Credentials / local env
@@ -19,3 +17,7 @@ __pycache__/
 # OS
 .DS_Store
 *.egg-info/
+
+# Exports (raw or sanitized) carry site addressing and MACs: they belong in the
+# private site repo, never in the engine repo.
+exports/

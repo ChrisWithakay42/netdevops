@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
-import time
 from pathlib import Path
 
 from .apply import ApplyAborted, fetch_live, plan_from_live, run_apply
-from .client import OPNsenseClient
+from .backup import state_dir_from_env, take_backup
+from .client import OPNsenseClient, _ssl_verify_from_env
 from .export import parse_export, write_intent
 from .intent import load_intent
 from .sanitize import sanitize_file
@@ -99,27 +100,49 @@ def cmd_apply(args) -> int:
             return 1
 
     try:
-        run_apply(client, intent, plan, live, prune=args.prune, backup=lambda: _backup(client))
+        run_apply(client, intent, plan, live, prune=args.prune, backup=lambda: _backup(args))
     except ApplyAborted as aborted:
         print(f"ABORTED: {aborted}", file=sys.stderr)
         return 3
+    except Exception as error:
+        # run_apply rolls back on errors during writes; anything reaching here
+        # came from the backup/pre-checks (nothing written) or the activation
+        # calls (writes saved and possibly partly live).
+        print(
+            f"FAILED: {error!r}\nCheck the firewall: saved config may differ from what "
+            "is running. Re-run plan; restore from the backup if in doubt.",
+            file=sys.stderr,
+        )
+        return 4
     print("Applied.")
     return 0
 
 
-def _backup(client: OPNsenseClient) -> None:
-    timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
-    raw_path = Path("exports/raw") / f"config-{client.host}-{timestamp}.xml"
-    raw_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    raw_path.touch(mode=0o600)
-    raw_path.write_bytes(client.download_config())
-    print(f"wrote {raw_path} (raw, gitignored)")
-    sanitized_path = sanitize_file(raw_path)
-    print(f"wrote {sanitized_path} (sanitized, safe to commit)")
+def _backup_client() -> OPNsenseClient:
+    """Separate credentials for config download when OPNSENSE_BACKUP_API_KEY is set.
+
+    Lets the apply key go without the backup privilege (which on 26.7 also
+    grants config restore).
+    """
+    if "OPNSENSE_BACKUP_API_KEY" not in os.environ:
+        return OPNsenseClient.from_env()
+    return OPNsenseClient(
+        host=os.environ["OPNSENSE_HOST"],
+        api_key=os.environ["OPNSENSE_BACKUP_API_KEY"],
+        api_secret=os.environ["OPNSENSE_BACKUP_API_SECRET"],
+        ssl_verify=_ssl_verify_from_env(),
+    )
+
+
+def _backup(args) -> None:
+    sanitized_dir = Path(args.dir).resolve().parent / "exports" / "sanitized"
+    raw_path, sanitized_path = take_backup(_backup_client(), state_dir_from_env(), sanitized_dir)
+    print(f"wrote {raw_path} (raw, private, outside the repo)")
+    print(f"wrote {sanitized_path} (sanitized; site repo only)")
 
 
 def cmd_backup(args) -> int:
-    _backup(OPNsenseClient.from_env())
+    _backup(args)
     return 0
 
 

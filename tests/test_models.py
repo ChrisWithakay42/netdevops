@@ -58,3 +58,15 @@ def test_rejects_invalid_vip():
 def test_accepts_self_token():
     intent = Intent(rules=[Rule(**_rule(destination_net="(self)"))])
     assert intent.rules[0].destination_net == "(self)"
+
+
+def test_unflagged_any_any_pass_rule_rejected_offline():
+    import pytest
+
+    from netdevops.models import Intent, Rule
+
+    rule = Rule(description="oops", interface=["lan"], sequence=1, action="pass")
+    with pytest.raises(ValueError, match="any -> any"):
+        Intent(rules=[rule])
+    Intent(rules=[rule.model_copy(update={"allow_any_any": True})])
+    Intent(rules=[rule.model_copy(update={"enabled": False})])

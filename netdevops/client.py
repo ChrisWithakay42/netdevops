@@ -8,8 +8,10 @@ the sync.
 Every set/del is guarded. OPNsense's setRule/setItem with an unknown uuid
 silently creates a new object from model defaults (for a filter rule:
 pass any -> any on every interface), and getRule/getItem answers 200 with an
-empty or template object. So a write goes ahead only when the uuid is
-well-formed and re-reading it returns the object the caller expects.
+or template object (on 26.7, alias/getItem/<unknown> returns a populated
+template). So a write goes ahead only when the uuid is well-formed and the
+bulk listing (alias/get, filter/get, vip_settings/get) holds it with the
+identity the caller expects.
 
 All read endpoints return the raw MVC model tree; `flatten_row` converts the
 per-field {option: {value, selected}} structures into plain strings so the
@@ -33,12 +35,13 @@ class WriteGuardError(RuntimeError):
 
 
 def _ssl_verify_from_env() -> bool | str:
-    """OPNSENSE_SSL_VERIFY: "0"/"1", or a path to the firewall's certificate.
+    """OPNSENSE_SSL_VERIFY: "1" (default), "0", or a path to the firewall's certificate.
 
     OPNsense ships a self-signed certificate, so the path form is how to keep
-    verification on without a publicly trusted CA.
+    verification on without a publicly trusted CA. "0" must be set explicitly:
+    the API secret and backup's config.xml travel over this connection.
     """
-    value = os.environ.get("OPNSENSE_SSL_VERIFY", "0")
+    value = os.environ.get("OPNSENSE_SSL_VERIFY", "1")
     if value in ("0", "1"):
         return value == "1"
     if not Path(value).is_file():
@@ -112,27 +115,42 @@ class OPNsenseClient:
 
     # -- guarded writes ---------------------------------------------------
 
-    def _require_existing(
-        self, get_path: str, wrapper: str, uuid: str, key_field: str, payload: dict | None
-    ) -> None:
-        """Refuse unless `uuid` is well-formed and names a live object.
+    _IDENTITY = {"alias": "name", "rule": "description", "snat": "description", "vip": "network"}
+
+    def _bulk(self, kind: str) -> dict[str, dict]:
+        if kind == "alias":
+            return self.get_aliases()
+        if kind in ("rule", "snat"):
+            rules, snat_rules = self.get_filter_model()
+            return rules if kind == "rule" else snat_rules
+        return self.get_vips()
+
+    def _require_existing(self, kind: str, uuid: str, payload: dict | None) -> None:
+        """Refuse unless `uuid` is well-formed and in the bulk listing for `kind`.
 
         For a set, the live object's identity field must also equal the
         payload's, so a uuid that points at a different object is refused too.
         """
         if not UUID_RE.match(uuid or ""):
             raise WriteGuardError(f"refusing write: malformed uuid {uuid!r}")
-        reply = self._get(f"{get_path}/{uuid}")
-        live = reply.get(wrapper) if isinstance(reply, dict) else None
+        live = self._bulk(kind).get(uuid)
         if not isinstance(live, dict) or not live:
-            raise WriteGuardError(f"refusing write: {get_path}/{uuid} does not exist")
+            raise WriteGuardError(f"refusing write: {kind} {uuid} does not exist")
         if payload is not None:
-            live_key = flatten_row({key_field: live.get(key_field, "")})[key_field]
-            if live_key != payload.get(key_field):
+            row = flatten_row(live)
+            key_field = self._IDENTITY[kind]
+            if kind == "vip":
+                row["network"] = f"{row.get('subnet', '')}/{row.get('subnet_bits', '')}"
+            if row.get(key_field, "") != payload.get(key_field):
                 raise WriteGuardError(
-                    f"refusing write: {uuid} is {live_key!r}, "
+                    f"refusing write: {kind} {uuid} is {row.get(key_field, '')!r}, "
                     f"expected {payload.get(key_field)!r}"
                 )
+
+    def _delete(self, path: str) -> None:
+        data = self._post(path)
+        if not isinstance(data, dict) or data.get("result") != "deleted":
+            raise WriteGuardError(f"{path}: delete not confirmed, reply {data!r}")
 
     def _add(self, path: str, body: dict) -> str:
         data = self._post(path, body)
@@ -145,55 +163,45 @@ class OPNsenseClient:
         return self._add("/api/firewall/alias/addItem", {"alias": payload})
 
     def set_alias(self, uuid: str, payload: dict) -> None:
-        self._require_existing("/api/firewall/alias/getItem", "alias", uuid, "name", payload)
+        self._require_existing("alias", uuid, payload)
         self._post(f"/api/firewall/alias/setItem/{uuid}", {"alias": payload})
 
     def del_alias(self, uuid: str) -> None:
-        self._require_existing("/api/firewall/alias/getItem", "alias", uuid, "name", None)
-        self._post(f"/api/firewall/alias/delItem/{uuid}")
+        self._require_existing("alias", uuid, None)
+        self._delete(f"/api/firewall/alias/delItem/{uuid}")
 
     def add_rule(self, payload: dict) -> str:
         return self._add("/api/firewall/filter/addRule", {"rule": payload})
 
     def set_rule(self, uuid: str, payload: dict) -> None:
-        self._require_existing(
-            "/api/firewall/filter/getRule", "rule", uuid, "description", payload
-        )
+        self._require_existing("rule", uuid, payload)
         self._post(f"/api/firewall/filter/setRule/{uuid}", {"rule": payload})
 
     def del_rule(self, uuid: str) -> None:
-        self._require_existing("/api/firewall/filter/getRule", "rule", uuid, "description", None)
-        self._post(f"/api/firewall/filter/delRule/{uuid}")
+        self._require_existing("rule", uuid, None)
+        self._delete(f"/api/firewall/filter/delRule/{uuid}")
 
     def add_snat(self, payload: dict) -> str:
         return self._add("/api/firewall/source_nat/addRule", {"rule": payload})
 
     def set_snat(self, uuid: str, payload: dict) -> None:
-        self._require_existing(
-            "/api/firewall/source_nat/getRule", "rule", uuid, "description", payload
-        )
+        self._require_existing("snat", uuid, payload)
         self._post(f"/api/firewall/source_nat/setRule/{uuid}", {"rule": payload})
 
     def del_snat(self, uuid: str) -> None:
-        self._require_existing(
-            "/api/firewall/source_nat/getRule", "rule", uuid, "description", None
-        )
-        self._post(f"/api/firewall/source_nat/delRule/{uuid}")
+        self._require_existing("snat", uuid, None)
+        self._delete(f"/api/firewall/source_nat/delRule/{uuid}")
 
     def add_vip(self, payload: dict) -> str:
         return self._add("/api/interfaces/vip_settings/addItem", {"vip": payload})
 
     def set_vip(self, uuid: str, payload: dict) -> None:
-        self._require_existing(
-            "/api/interfaces/vip_settings/getItem", "vip", uuid, "network", payload
-        )
+        self._require_existing("vip", uuid, payload)
         self._post(f"/api/interfaces/vip_settings/setItem/{uuid}", {"vip": payload})
 
     def del_vip(self, uuid: str) -> None:
-        self._require_existing(
-            "/api/interfaces/vip_settings/getItem", "vip", uuid, "network", None
-        )
-        self._post(f"/api/interfaces/vip_settings/delItem/{uuid}")
+        self._require_existing("vip", uuid, None)
+        self._delete(f"/api/interfaces/vip_settings/delItem/{uuid}")
 
     # -- activation -------------------------------------------------------
 

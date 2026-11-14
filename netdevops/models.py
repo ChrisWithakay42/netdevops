@@ -221,6 +221,22 @@ class Intent(BaseModel):
 
         errors.extend(self._virtual_ip_errors())
 
+        for rule in self.rules:
+            if (
+                rule.enabled
+                and rule.action == "pass"
+                and not rule.allow_any_any
+                and rule.source_net in ("any", "0.0.0.0/0", "::/0")
+                and rule.destination_net in ("any", "0.0.0.0/0", "::/0")
+                and not rule.source_invert
+                and not rule.destination_invert
+                and rule.destination_port in ("", "any", "1:65535", "0:65535")
+            ):
+                errors.append(
+                    f"rule '{rule.description}': pass any -> any with no port; "
+                    "set allow_any_any: true if that is really intended"
+                )
+
         if errors:
             raise ValueError("\n".join(errors))
         return self

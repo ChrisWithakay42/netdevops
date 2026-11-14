@@ -85,3 +85,29 @@ def test_sanitize_file_refuses_leaky_output(tmp_path):
     with pytest.raises(RuntimeError, match="sanitization incomplete"):
         sanitize_file(source_path, tmp_path / "out")
     assert not (tmp_path / "out" / "config.xml").exists()
+
+
+def test_sanitize_redacts_vpn_ldap_and_api_key_material():
+    xml_text = (
+        "<opnsense>"
+        "<wireguard><server><privkey>wgPRIV=</privkey><pubkey>wgPUB=</pubkey></server></wireguard>"
+        "<openvpn><tls>STATICTLS</tls><shared_key>SHAREDK</shared_key></openvpn>"
+        "<authserver><ldap_bindpw>LDAPSECRET</ldap_bindpw></authserver>"
+        "<user><apikeys><item><key>APIKEYHALF</key><secret>s</secret></item></apikeys></user>"
+        "</opnsense>"
+    )
+    tree = ET.ElementTree(ET.fromstring(xml_text))
+    sanitize_tree(tree)
+    dumped = ET.tostring(tree.getroot(), encoding="unicode")
+    for secret in ("wgPRIV=", "STATICTLS", "SHAREDK", "LDAPSECRET", "APIKEYHALF"):
+        assert secret not in dumped
+    assert "wgPUB=" in dumped  # public key kept
+
+
+def test_sanitize_canary_catches_openvpn_static_key(tmp_path):
+    source_path = tmp_path / "config.xml"
+    source_path.write_text(
+        "<opnsense><odd>-----BEGIN OpenVPN Static key V1-----</odd></opnsense>"
+    )
+    with pytest.raises(RuntimeError, match="sanitization incomplete"):
+        sanitize_file(source_path, tmp_path / "out")

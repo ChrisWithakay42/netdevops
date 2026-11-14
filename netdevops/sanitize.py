@@ -27,11 +27,25 @@ SECRET_TAGS = {
     "radius_secret",
     "varusersfreeradiuspassword",
     "privatekey",
+    "privkey",  # WireGuard
     "pubkey_seed",
+    "tls",  # OpenVPN tls-auth/tls-crypt static key
+    "shared_key",  # OpenVPN static key
+    "ldap_bindpw",
 }
 
+# Every descendant of these is redacted (API key *and* secret halves).
+SECRET_CONTAINERS = {"apikeys"}
+
 # If any of these substrings survive sanitization, refuse to bless the output.
-CANARIES = ("$2y$", "BEGIN PRIVATE", "BEGIN RSA", "BEGIN EC PRIVATE")
+CANARIES = (
+    "$2y$",
+    "BEGIN PRIVATE",
+    "BEGIN RSA",
+    "BEGIN EC PRIVATE",
+    "BEGIN OPENSSH PRIVATE",
+    "BEGIN OpenVPN Static key",
+)
 
 
 def sanitize_tree(tree: ET.ElementTree) -> int:
@@ -40,6 +54,11 @@ def sanitize_tree(tree: ET.ElementTree) -> int:
         if element.tag.lower() in SECRET_TAGS and (element.text or "").strip():
             element.text = REDACTED
             count += 1
+        if element.tag.lower() in SECRET_CONTAINERS:
+            for descendant in element.iter():
+                if descendant is not element and (descendant.text or "").strip():
+                    descendant.text = REDACTED
+                    count += 1
     return count
 
 

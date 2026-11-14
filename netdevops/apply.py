@@ -1,25 +1,42 @@
-"""Apply a plan in stages, checking live state before each activation.
+"""Apply a plan: write everything, check it, and only then activate.
 
-Stages run in dependency order: aliases (rules and NAT reference them), then
-IP-alias VIPs (a rule or service may need the address), then filter rules and
-source NAT. Each stage writes, re-reads the live uuids, refuses to activate if
-any object appeared that this run did not create (removing it first), and only
-then reconfigures. The filter stage also refuses to load any enabled
-"pass any -> any" rule the intent does not explicitly allow.
+Activation must come last because on OPNsense 26.7 alias/reconfigure also runs
+"filter reload": the moment aliases are activated, every saved filter rule goes
+live. So the flow is:
 
-There is no cross-service transaction, so a failure leaves earlier stages
-applied; the backup taken first is the way back.
+1. Backup, then re-read live state; abort if it changed since the plan (a
+   concurrent GUI edit) or already holds an unapproved pass any -> any rule.
+2. Write all kinds: aliases, IP-alias VIPs, filter rules, source NAT. Aliases
+   first because rules reference them.
+3. Re-read everything. Abort if an object appeared that this run did not
+   create, or the saved ruleset holds an unapproved pass any -> any rule.
+4. Activate only the kinds that changed.
+
+Any failure in steps 2-3 undoes this run's own writes from the pre-images
+(creates deleted, updates restored), so nothing half-written is left saved for
+the next filter reload to pick up. A stray is auto-deleted only when it has the
+pass-all signature; anything else is most likely someone's GUI work and is
+reported instead. Deletions made by --prune can't be undone here; restore them
+from the backup.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import diff as diff_mod
 from .client import flatten_row
 from .models import Intent
-from .safety import pass_all_rules, stray_uuids
+from .safety import any_aliases, pass_all_rules, stray_uuids
+
+KINDS = ("alias", "vip", "rule", "snat")
+ACTIVATE = {
+    "alias": "reconfigure_aliases",
+    "vip": "reconfigure_vips",
+    "rule": "apply_filter",
+    "snat": "apply_filter",
+}
 
 
 class ApplyAborted(RuntimeError):
@@ -32,6 +49,11 @@ class LiveState:
     rules: dict[str, dict]
     snat: dict[str, dict]
     vips: dict[str, dict]  # IP-alias only, normalised by diff.live_vip_rows
+
+    def of(self, kind: str) -> dict[str, dict]:
+        return {"alias": self.aliases, "rule": self.rules, "snat": self.snat, "vip": self.vips}[
+            kind
+        ]
 
 
 def fetch_live(client) -> LiveState:
@@ -50,48 +72,111 @@ def plan_from_live(intent: Intent, live: LiveState) -> diff_mod.Plan:
     return diff_mod.build_plan(intent, live.aliases, live.rules, live.snat, live_vips=live.vips)
 
 
-def _write_kind(client, plan, kind, prune, echo) -> tuple[set[str], set[str]]:
-    """Run one kind's creates, updates and prunes; return (created, deleted) uuids."""
-    created, deleted = set(), set()
-    for change in plan.creates:
-        if change.kind == kind:
-            created.add(getattr(client, f"add_{kind}")(change.payload))
-            echo(f"created {kind}: {change.label}")
-    for change in plan.updates:
-        if change.kind == kind:
-            getattr(client, f"set_{kind}")(change.uuid, change.payload)
-            echo(f"updated {kind}: {change.label}")
-    if prune:
-        for change in plan.prunable():
+def _approved_any_any(intent: Intent) -> set[tuple[str, frozenset[str]]]:
+    return {
+        (rule.description, frozenset(rule.interface))
+        for rule in intent.rules
+        if rule.allow_any_any
+    }
+
+
+def _pass_all(intent: Intent, live: LiveState) -> list[str]:
+    return pass_all_rules(live.rules, _approved_any_any(intent), any_aliases(live.aliases))
+
+
+def _restore_payload(kind: str, change: diff_mod.Change, before_row: dict) -> dict:
+    """The pre-image in the payload's shape, limited to the fields this run changed."""
+    restored = {field_name: before_row.get(field_name, "") for field_name in change.payload}
+    if kind == "alias":  # flattened content is comma-joined; the API wants newlines
+        restored["content"] = restored["content"].replace(",", "\n")
+    return restored
+
+
+@dataclass
+class _Journal:
+    created: dict[str, set[str]] = field(default_factory=lambda: {kind: set() for kind in KINDS})
+    updated: list[tuple[str, diff_mod.Change]] = field(default_factory=list)
+    deleted: dict[str, set[str]] = field(default_factory=lambda: {kind: set() for kind in KINDS})
+
+    def touched(self) -> set[str]:
+        return {
+            kind
+            for kind in KINDS
+            if self.created[kind] or self.deleted[kind]
+        } | {kind for kind, _ in self.updated}
+
+
+def _write(client, plan, prune, journal, echo) -> None:
+    for kind in KINDS:
+        for change in plan.creates:
             if change.kind == kind:
-                getattr(client, f"del_{kind}")(change.uuid)
-                deleted.add(change.uuid)
-                echo(f"deleted {kind}: {change.label}")
-    return created, deleted
+                journal.created[kind].add(getattr(client, f"add_{kind}")(change.payload))
+                echo(f"created {kind}: {change.label}")
+        for change in plan.updates:
+            if change.kind == kind:
+                getattr(client, f"set_{kind}")(change.uuid, change.payload)
+                journal.updated.append((kind, change))
+                echo(f"updated {kind}: {change.label}")
+    if prune:
+        for kind in reversed(KINDS):  # rules before the aliases they reference
+            for change in plan.prunable():
+                if change.kind == kind:
+                    getattr(client, f"del_{kind}")(change.uuid)
+                    journal.deleted[kind].add(change.uuid)
+                    echo(f"deleted {kind}: {change.label}")
 
 
-def _check_strays(client, kind, before, after, created, deleted, echo) -> None:
-    """`before` and `after` must be filtered the same way (e.g. IP-alias VIPs only)."""
-    strays = stray_uuids(set(before), set(after), created, deleted)
-    if not strays:
-        return
-    if kind in diff_mod.NEVER_PRUNED:
-        raise ApplyAborted(
-            f"stray {kind} object(s) {sorted(strays)} appeared during the writes; "
-            "left in place (never auto-deleted) and did not activate this stage"
+def _check(client, intent, before, journal, echo) -> None:
+    after = fetch_live(client)
+    problems = []
+    for kind in KINDS:
+        strays = stray_uuids(
+            set(before.of(kind)), set(after.of(kind)), journal.created[kind], journal.deleted[kind]
         )
-    for uuid in sorted(strays):
-        getattr(client, f"del_{kind}")(uuid)
-        echo(f"removed stray {kind} {uuid}")
-    raise ApplyAborted(
-        f"stray {kind} object(s) {sorted(strays)} appeared during the writes; "
-        "removed them and did not activate this stage"
-    )
+        if not strays:
+            continue
+        pass_all_strays = (
+            set(_pass_all(intent, after)) & strays if kind == "rule" else set()
+        )
+        for uuid in sorted(pass_all_strays):
+            client.del_rule(uuid)
+            echo(f"removed stray pass-all rule {uuid}")
+        left = sorted(strays - pass_all_strays)
+        problems.append(
+            f"stray {kind} object(s) appeared during the writes: "
+            f"removed pass-all {sorted(pass_all_strays)}, left in place {left}"
+        )
+    offenders = _pass_all(intent, fetch_live(client)) if not problems else []
+    if offenders:
+        problems.append(f"enabled pass any -> any rule(s) {offenders} in the saved ruleset")
+    if problems:
+        raise ApplyAborted("; ".join(problems))
 
 
-def _has_changes(plan, kinds, prune) -> bool:
-    pending = plan.creates + plan.updates + (plan.prunable() if prune else [])
-    return any(change.kind in kinds for change in pending)
+def _rollback(client, before, journal, echo) -> list[str]:
+    failures = []
+    for kind in reversed(KINDS):
+        for uuid in sorted(journal.created[kind]):
+            try:
+                getattr(client, f"del_{kind}")(uuid)
+                echo(f"rolled back create {kind} {uuid}")
+            except Exception as error:  # keep going: undo as much as possible
+                failures.append(f"delete {kind} {uuid}: {error}")
+    for kind, change in reversed(journal.updated):
+        try:
+            payload = _restore_payload(kind, change, before.of(kind)[change.uuid])
+            getattr(client, f"set_{kind}")(change.uuid, payload)
+            echo(f"rolled back update {kind}: {change.label}")
+        except Exception as error:
+            failures.append(f"restore {kind} {change.label}: {error}")
+    for kind in KINDS:
+        for uuid in sorted(journal.deleted[kind]):
+            failures.append(f"pruned {kind} {uuid} is gone; restore it from the backup")
+    return failures
+
+
+def _unchanged(before: LiveState, now: LiveState) -> bool:
+    return all(before.of(kind) == now.of(kind) for kind in KINDS)
 
 
 def run_apply(
@@ -103,39 +188,30 @@ def run_apply(
     backup: Callable[[], object],
     echo: Callable[[str], None] = print,
 ) -> None:
-    if not _has_changes(plan, {"alias", "vip", "rule", "snat"}, prune):
+    pending = plan.creates + plan.updates + (plan.prunable() if prune else [])
+    if not pending:
         return
     backup()  # no backup, no writes
 
-    if _has_changes(plan, {"alias"}, prune):
-        created, deleted = _write_kind(client, plan, "alias", prune, echo)
-        _check_strays(client, "alias", before.aliases, client.get_aliases(), created, deleted, echo)
-        client.reconfigure_aliases()
-
-    if _has_changes(plan, {"vip"}, prune):
-        created, deleted = _write_kind(client, plan, "vip", prune, echo)
-        after_vips = diff_mod.live_vip_rows(
-            {uuid: flatten_row(row) for uuid, row in client.get_vips().items()}
+    if not _unchanged(before, fetch_live(client)):
+        raise ApplyAborted("live state changed since the plan (GUI edit?); re-run plan")
+    offenders = _pass_all(intent, before)
+    if offenders:
+        raise ApplyAborted(
+            f"live ruleset already holds enabled pass any -> any rule(s) {offenders}; "
+            "nothing written. Fix them, or mark the intent rule allow_any_any"
         )
-        _check_strays(client, "vip", before.vips, after_vips, created, deleted, echo)
-        client.reconfigure_vips()
 
-    if _has_changes(plan, {"rule", "snat"}, prune):
-        rules_created, rules_deleted = _write_kind(client, plan, "rule", prune, echo)
-        snat_created, snat_deleted = _write_kind(client, plan, "snat", prune, echo)
-        raw_rules, raw_snat = client.get_filter_model()
-        _check_strays(client, "rule", before.rules, raw_rules, rules_created, rules_deleted, echo)
-        _check_strays(client, "snat", before.snat, raw_snat, snat_created, snat_deleted, echo)
-        allowed = {
-            (rule.description, frozenset(rule.interface))
-            for rule in intent.rules
-            if rule.allow_any_any
-        }
-        live_rules = {uuid: flatten_row(row) for uuid, row in raw_rules.items()}
-        offenders = pass_all_rules(live_rules, allowed)
-        if offenders:
-            raise ApplyAborted(
-                f"enabled pass any -> any rule(s) {offenders} in the saved ruleset; "
-                "filter NOT applied. Fix them, or mark the intent rule allow_any_any"
-            )
-        client.apply_filter()
+    journal = _Journal()
+    try:
+        _write(client, plan, prune, journal, echo)
+        _check(client, intent, before, journal, echo)
+    except Exception as error:
+        failures = _rollback(client, before, journal, echo)
+        detail = "; ".join(failures) if failures else "all writes undone"
+        raise ApplyAborted(
+            f"{error}. Nothing activated; rolled back this run's writes ({detail})"
+        ) from error
+
+    for method in dict.fromkeys(ACTIVATE[kind] for kind in KINDS if kind in journal.touched()):
+        getattr(client, method)()
