@@ -111,3 +111,14 @@ def test_sanitize_canary_catches_openvpn_static_key(tmp_path):
     )
     with pytest.raises(RuntimeError, match="sanitization incomplete"):
         sanitize_file(source_path, tmp_path / "out")
+
+
+def test_sanitize_redacts_cloudflared_token():
+    xml_text = (
+        "<opnsense><OPNsense><Cloudflared><general>"
+        "<token>eyJhIjoiTUNMT1VERkxBUkVUT0tFTiJ9</token>"
+        "</general></Cloudflared></OPNsense></opnsense>"
+    )
+    tree = ET.ElementTree(ET.fromstring(xml_text))
+    sanitize_tree(tree)
+    assert "eyJhIjoi" not in ET.tostring(tree.getroot(), encoding="unicode")

@@ -32,6 +32,7 @@ SECRET_TAGS = {
     "tls",  # OpenVPN tls-auth/tls-crypt static key
     "shared_key",  # OpenVPN static key
     "ldap_bindpw",
+    "token",  # e.g. Cloudflared tunnel token
 }
 
 # Every descendant of these is redacted (API key *and* secret halves).
