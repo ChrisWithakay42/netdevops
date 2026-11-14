@@ -179,12 +179,26 @@ def _diff_kind(plan, kind, desired_items, live, key_of_desired, key_of_live, pay
     for uuid, live_row in live.items():
         if uuid not in matched_uuids:
             label = (
-                live_row.get("description")
+                (live_row.get("name") if kind == "alias" else None)
+                or live_row.get("description")
                 or live_row.get("name")
                 or live_row.get("network")
                 or uuid
             )
             plan.unmanaged.append(Change(kind, label, {}, uuid))
+
+
+# Aliases OPNsense generates itself (per-interface nets, bogons, lockout
+# tables). They are not in config.xml and must never be managed or pruned.
+SYSTEM_ALIAS_NAMES = {"bogons", "bogonsv6", "sshlockout", "virusprot"}
+
+
+def _user_aliases(live_aliases: dict[str, dict]) -> dict[str, dict]:
+    return {
+        uuid: row
+        for uuid, row in live_aliases.items()
+        if row.get("type") != "internal" and row.get("name") not in SYSTEM_ALIAS_NAMES
+    }
 
 
 def build_plan(
@@ -197,7 +211,7 @@ def build_plan(
     """live_vips must already be normalised by live_vip_rows()."""
     plan = Plan()
     _diff_kind(
-        plan, "alias", intent.aliases, live_aliases,
+        plan, "alias", intent.aliases, _user_aliases(live_aliases),
         key_of_desired=lambda alias: alias.name,
         key_of_live=lambda live_row: live_row.get("name", ""),
         payload_of=alias_payload,

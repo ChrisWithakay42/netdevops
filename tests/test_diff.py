@@ -122,3 +122,14 @@ def test_multi_network_order_is_not_a_change():
     rule = RULE.model_copy(update={"destination_net": "lan,opt2"})
     live = dict(LIVE_RULE, destination_net="opt2,lan")
     assert plan_for(Intent(rules=[rule]), live_rules={"u1": live}).empty
+
+
+def test_system_aliases_are_invisible_to_plan_and_prune():
+    live_aliases = {
+        "u1": {"name": "__opt5_network", "type": "internal", "description": "ADM net"},
+        "u2": {"name": "bogons", "type": "external", "description": "bogon networks (internal)"},
+        "u3": {"name": "sshlockout", "type": "external", "description": "abuse lockout"},
+        "u4": {"name": "MY_EXTERNAL", "type": "external", "description": "user-defined"},
+    }
+    plan = plan_for(Intent(), live_aliases=live_aliases)
+    assert [change.label for change in plan.unmanaged] == ["MY_EXTERNAL"]
