@@ -71,9 +71,15 @@ def _write_kind(client, plan, kind, prune, echo) -> tuple[set[str], set[str]]:
 
 
 def _check_strays(client, kind, before, after, created, deleted, echo) -> None:
+    """`before` and `after` must be filtered the same way (e.g. IP-alias VIPs only)."""
     strays = stray_uuids(set(before), set(after), created, deleted)
     if not strays:
         return
+    if kind in diff_mod.NEVER_PRUNED:
+        raise ApplyAborted(
+            f"stray {kind} object(s) {sorted(strays)} appeared during the writes; "
+            "left in place (never auto-deleted) and did not activate this stage"
+        )
     for uuid in sorted(strays):
         getattr(client, f"del_{kind}")(uuid)
         echo(f"removed stray {kind} {uuid}")
@@ -108,7 +114,10 @@ def run_apply(
 
     if _has_changes(plan, {"vip"}, prune):
         created, deleted = _write_kind(client, plan, "vip", prune, echo)
-        _check_strays(client, "vip", before.vips, client.get_vips(), created, deleted, echo)
+        after_vips = diff_mod.live_vip_rows(
+            {uuid: flatten_row(row) for uuid, row in client.get_vips().items()}
+        )
+        _check_strays(client, "vip", before.vips, after_vips, created, deleted, echo)
         client.reconfigure_vips()
 
     if _has_changes(plan, {"rule", "snat"}, prune):
@@ -117,7 +126,11 @@ def run_apply(
         raw_rules, raw_snat = client.get_filter_model()
         _check_strays(client, "rule", before.rules, raw_rules, rules_created, rules_deleted, echo)
         _check_strays(client, "snat", before.snat, raw_snat, snat_created, snat_deleted, echo)
-        allowed = {rule.description for rule in intent.rules if rule.allow_any_any}
+        allowed = {
+            (rule.description, frozenset(rule.interface))
+            for rule in intent.rules
+            if rule.allow_any_any
+        }
         live_rules = {uuid: flatten_row(row) for uuid, row in raw_rules.items()}
         offenders = pass_all_rules(live_rules, allowed)
         if offenders:

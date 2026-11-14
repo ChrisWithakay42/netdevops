@@ -15,13 +15,21 @@ def stray_uuids(
     return after - (before - deleted) - created
 
 
-def pass_all_rules(live_rules: dict[str, dict], allowed: set[str]) -> list[str]:
+def pass_all_rules(
+    live_rules: dict[str, dict], allowed: set[tuple[str, frozenset[str]]]
+) -> list[str]:
     """uuids of enabled pass rules with no source, destination or port restriction.
 
-    `allowed` holds descriptions of rules the intent marks allow_any_any.
+    `allowed` holds the (description, interface set) match keys of rules the
+    intent marks allow_any_any: the same identity plan/apply use, so a rule
+    with the same description on other interfaces is not exempt.
     """
     found = []
     for uuid, row in live_rules.items():
+        live_key = (
+            row.get("description", ""),
+            frozenset(name for name in row.get("interface", "").split(",") if name),
+        )
         if (
             row.get("enabled") == "1"
             and row.get("action") == "pass"
@@ -30,7 +38,7 @@ def pass_all_rules(live_rules: dict[str, dict], allowed: set[str]) -> list[str]:
             and row.get("source_not", "0") != "1"
             and row.get("destination_not", "0") != "1"
             and not row.get("destination_port")
-            and row.get("description", "") not in allowed
+            and live_key not in allowed
         ):
             found.append(uuid)
     return found

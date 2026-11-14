@@ -192,3 +192,47 @@ def test_no_backup_no_writes():
     with pytest.raises(OSError):
         apply(firewall, Intent(rules=[RULE]), backup=failing_backup)
     assert firewall.rules == {}
+
+
+def test_carp_vips_are_not_mistaken_for_strays():
+    firewall = FakeFirewall()
+    firewall.vips["44444444-4444-4444-8444-444444444444"] = {
+        "mode": "carp", "interface": "lan", "subnet": "192.168.1.2",
+        "subnet_bits": "24", "descr": "CARP",
+    }
+    apply(firewall, Intent(virtual_ips=[VirtualIP(address="10.20.0.53/32", interface="lo0")]))
+    assert "44444444-4444-4444-8444-444444444444" in firewall.vips
+    assert firewall.calls[-1] == "reconfigure_vips"
+
+
+def test_stray_vip_aborts_without_deleting_it():
+    firewall = FakeFirewall()
+    original_add = firewall.add_vip
+
+    def add_and_spawn(payload):
+        firewall.vips["55555555-5555-4555-8555-555555555555"] = {
+            "mode": "ipalias", "interface": "opt5", "subnet": "192.168.50.1",
+            "subnet_bits": "29", "descr": "appeared",
+        }
+        return original_add(payload)
+
+    firewall.add_vip = add_and_spawn
+    with pytest.raises(ApplyAborted, match="stray"):
+        apply(firewall, Intent(virtual_ips=[VirtualIP(address="10.20.0.53/32", interface="lo0")]))
+    assert "del_vip" not in firewall.calls
+    assert "reconfigure_vips" not in firewall.calls
+
+
+def test_allow_any_any_only_exempts_the_same_interface_set():
+    firewall = FakeFirewall()
+    allowed = Rule(
+        description="Lab any-any", interface=["lan"], sequence=5, action="pass",
+        allow_any_any=True,
+    )
+    # same description on more interfaces is not the approved rule
+    firewall.rules["66666666-6666-4666-8666-666666666666"] = dict(
+        ROGUE, description="Lab any-any", interface="lan,wan"
+    )
+    with pytest.raises(ApplyAborted, match="pass any"):
+        apply(firewall, Intent(rules=[allowed]))
+    assert "apply_filter" not in firewall.calls

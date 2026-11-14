@@ -47,4 +47,11 @@ def test_pass_all_ignores_disabled_restricted_and_allowed():
         "i": inverted,
         "a": allowed,
     }
-    assert pass_all_rules(live, allowed={"Owner-approved any-any"}) == []
+    approved = {("Owner-approved any-any", frozenset({"lan", "opt1", "opt2"}))}
+    assert pass_all_rules(live, allowed=approved) == []
+
+
+def test_pass_all_exemption_needs_matching_interface_set():
+    live = {"a": PASS_ALL | {"description": "Owner-approved any-any"}}
+    approved = {("Owner-approved any-any", frozenset({"lan"}))}
+    assert pass_all_rules(live, allowed=approved) == ["a"]
