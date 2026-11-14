@@ -100,3 +100,14 @@ def test_multi_network_fields_accepted_and_each_token_checked():
     Intent(rules=[Rule(**_rule(destination_net="(self),opt4", destination_port="179"))])
     with pytest.raises(pydantic.ValidationError, match="nope"):
         Intent(rules=[Rule(**_rule(destination_net="lan,nope", destination_port="1"))])
+
+
+def test_comma_lists_may_not_contain_raw_addresses():
+    # OPNsense 26.7 accepts "lan,opt2" or "AliasA,opt5" but rejects
+    # "192.168.50.1,10.20.50.1" ("is not a valid source IP address or alias"),
+    # found live 2026-11-14. Catch it offline.
+    with pytest.raises(pydantic.ValidationError, match="comma"):
+        bad = Rule(**_rule(destination_net="192.168.50.1,10.20.50.1", destination_port="443"))
+        Intent(rules=[bad])
+    Intent(rules=[Rule(**_rule(destination_net="lan,opt2", destination_port="443"))])
+    Intent(rules=[Rule(**_rule(destination_net="10.20.50.1", destination_port="443"))])

@@ -208,6 +208,12 @@ class Intent(BaseModel):
                     errors.append(
                         f"{label}: {field_name} {value!r} is not an alias, builtin, or CIDR"
                     )
+                elif "," in value and any(is_cidr(token) for token in value.split(",")):
+                    # 26.7 only accepts comma lists of aliases/network tokens
+                    errors.append(
+                        f"{label}: {field_name} {value!r}: a comma list may hold aliases or "
+                        "network tokens only; put addresses in an alias"
+                    )
             for field_name in ("source_port", "destination_port"):
                 value = getattr(rule, field_name)
                 if value and not PORT_RE.match(value):
