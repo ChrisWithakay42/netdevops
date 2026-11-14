@@ -79,6 +79,8 @@ class Rule(BaseModel):
     quick: bool = True
     log: bool = False
     enabled: bool = True
+    # opt-out of the pre-apply "pass any -> any" check; not sent to the API
+    allow_any_any: bool = False
 
     @field_validator("interface")
     @classmethod
@@ -120,12 +122,35 @@ class Interface(BaseModel):
     address: str = ""
 
 
+class VirtualIP(BaseModel):
+    """An IP-alias virtual IP. Managed: pushed via Interfaces > Virtual IPs."""
+
+    address: str  # CIDR, e.g. 10.20.0.53/32; the match key
+    interface: str
+    description: str = ""
+
+    @field_validator("address")
+    @classmethod
+    def _validate_address(cls, value: str) -> str:
+        if "/" not in value or not is_cidr(value):
+            raise ValueError(f"virtual IP {value!r} must be an address with a prefix length")
+        return str(ipaddress.ip_interface(value))
+
+    @field_validator("interface")
+    @classmethod
+    def _validate_interface(cls, value: str) -> str:
+        if value not in VALID_INTERFACES | {"lo0"}:
+            raise ValueError(f"unknown interface {value!r}")
+        return value
+
+
 class Intent(BaseModel):
     aliases: list[Alias] = Field(default_factory=list)
     rules: list[Rule] = Field(default_factory=list)
     snat_rules: list[SnatRule] = Field(default_factory=list)
     interfaces: list[Interface] = Field(default_factory=list)
     vips: list[str] = Field(default_factory=list)  # CARP VIPs, part of "(self)"
+    virtual_ips: list[VirtualIP] = Field(default_factory=list)  # IP aliases, managed
 
     @field_validator("vips")
     @classmethod
@@ -194,6 +219,35 @@ class Intent(BaseModel):
                     f"{label}: target {snat_rule.target!r} is not an alias, builtin, or IP"
                 )
 
+        errors.extend(self._virtual_ip_errors())
+
         if errors:
             raise ValueError("\n".join(errors))
         return self
+
+    def _virtual_ip_errors(self) -> list[str]:
+        errors: list[str] = []
+        addresses = [vip.address for vip in self.virtual_ips]
+        for duplicate in {address for address in addresses if addresses.count(address) > 1}:
+            errors.append(f"duplicate virtual IP {duplicate!r}")
+        primary_networks = {
+            interface.token: ipaddress.ip_network(interface.cidr)
+            for interface in self.interfaces
+            if interface.cidr
+        }
+        for vip in self.virtual_ips:
+            vip_interface = ipaddress.ip_interface(vip.address)
+            primary = primary_networks.get(vip.interface)
+            # An address outside the primary subnet (e.g. the old gateway kept
+            # during a re-address) needs its own network's prefix, or the
+            # firewall has no connected route back to that network's clients.
+            if (
+                primary is not None
+                and vip_interface.ip not in primary
+                and vip_interface.network.prefixlen == vip_interface.max_prefixlen
+            ):
+                errors.append(
+                    f"virtual IP {vip.address} is outside {vip.interface}'s primary "
+                    f"subnet {primary}; give it the prefix of the network it serves"
+                )
+        return errors

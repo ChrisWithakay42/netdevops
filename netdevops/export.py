@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import Alias, Intent, Interface, Rule, SnatRule
+from .models import Alias, Intent, Interface, Rule, SnatRule, VirtualIP
 
 HEADER = (
     "# Source of truth for the OPNsense firewall policy.\n"
@@ -118,14 +118,30 @@ def parse_export(path: str | Path) -> Intent:
             )
 
     vips = []
+    virtual_ips = []
     virtualip_section = root.find("virtualip")
     if virtualip_section is not None:
         for vip_element in virtualip_section:
-            if _text(vip_element, "mode") == "carp" and _text(vip_element, "subnet"):
-                vips.append(_text(vip_element, "subnet"))
+            mode = _text(vip_element, "mode")
+            subnet = _text(vip_element, "subnet")
+            if mode == "carp" and subnet:
+                vips.append(subnet)
+            elif mode == "ipalias" and subnet:
+                virtual_ips.append(
+                    VirtualIP(
+                        address=f"{subnet}/{_text(vip_element, 'subnet_bits') or '32'}",
+                        interface=_text(vip_element, "interface"),
+                        description=_text(vip_element, "descr"),
+                    )
+                )
 
     return Intent(
-        aliases=aliases, rules=rules, snat_rules=snat_rules, interfaces=interfaces, vips=vips
+        aliases=aliases,
+        rules=rules,
+        snat_rules=snat_rules,
+        interfaces=interfaces,
+        vips=vips,
+        virtual_ips=virtual_ips,
     )
 
 
@@ -139,6 +155,7 @@ def write_intent(intent: Intent, directory: str | Path = "network") -> list[Path
         "interfaces.yml": {
             "interfaces": [interface.model_dump() for interface in intent.interfaces],
             "vips": intent.vips,
+            "virtual_ips": [vip.model_dump() for vip in intent.virtual_ips],
         },
     }
     written_paths = []

@@ -7,8 +7,8 @@ import sys
 import time
 from pathlib import Path
 
-from . import diff as diff_mod
-from .client import OPNsenseClient, flatten_row
+from .apply import ApplyAborted, fetch_live, plan_from_live, run_apply
+from .client import OPNsenseClient
 from .export import parse_export, write_intent
 from .intent import load_intent
 from .sanitize import sanitize_file
@@ -26,7 +26,8 @@ def cmd_validate(args) -> int:
     intent = _load(args.dir)
     print(
         f"OK: {len(intent.aliases)} aliases, {len(intent.rules)} rules, "
-        f"{len(intent.snat_rules)} SNAT rules, {len(intent.interfaces)} interfaces"
+        f"{len(intent.snat_rules)} SNAT rules, {len(intent.virtual_ips)} virtual IPs, "
+        f"{len(intent.interfaces)} interfaces"
     )
     return 0
 
@@ -45,22 +46,23 @@ def cmd_sanitize(args) -> int:
     return 0
 
 
-_ONLY_KINDS = {"aliases": "alias", "rules": "rule", "nat": "snat"}
+_ONLY_KINDS = {"aliases": "alias", "rules": "rule", "nat": "snat", "vips": "vip"}
 
 
 def _build_plan(args):
     intent = _load(args.dir)
     client = OPNsenseClient.from_env()
-    live_aliases = {uuid: flatten_row(row) for uuid, row in client.get_aliases().items()}
-    raw_rules, raw_snat = client.get_filter_model()
-    live_rules = {uuid: flatten_row(row) for uuid, row in raw_rules.items()}
-    live_snat = {uuid: flatten_row(row) for uuid, row in raw_snat.items()}
-    plan = diff_mod.build_plan(intent, live_aliases, live_rules, live_snat)
+    live = fetch_live(client)
+    try:
+        plan = plan_from_live(intent, live)
+    except ValueError as conflict:
+        print(f"plan FAILED: {conflict}", file=sys.stderr)
+        raise SystemExit(1) from conflict
     if getattr(args, "only", None):
         kind = _ONLY_KINDS[args.only]
         for change_list in (plan.creates, plan.updates, plan.unmanaged):
             change_list[:] = [change for change in change_list if change.kind == kind]
-    return client, plan
+    return client, intent, live, plan
 
 
 def _print_plan(plan) -> None:
@@ -69,12 +71,13 @@ def _print_plan(plan) -> None:
     for change in plan.updates:
         print(f"  ~ update {change.kind}: {change.label}  ({', '.join(change.changed)})")
     for change in plan.unmanaged:
-        print(f"  ! live-only {change.kind}: {change.label}")
+        note = "" if change in plan.prunable() else " (never pruned)"
+        print(f"  ! live-only {change.kind}: {change.label}{note}")
     print(f"\nPlan: {plan.summary()}")
 
 
 def cmd_plan(args) -> int:
-    _, plan = _build_plan(args)
+    _, _, _, plan = _build_plan(args)
     if plan.empty and not plan.unmanaged:
         print("No changes. Firewall matches intent.")
         return 0
@@ -83,8 +86,8 @@ def cmd_plan(args) -> int:
 
 
 def cmd_apply(args) -> int:
-    client, plan = _build_plan(args)
-    if plan.empty and not (args.prune and plan.unmanaged):
+    client, intent, live, plan = _build_plan(args)
+    if plan.empty and not (args.prune and plan.prunable()):
         print("No changes. Firewall matches intent.")
         return 0
     _print_plan(plan)
@@ -95,35 +98,28 @@ def cmd_apply(args) -> int:
             print("Aborted.")
             return 1
 
-    create_actions = {"alias": client.add_alias, "rule": client.add_rule, "snat": client.add_snat}
-    update_actions = {"alias": client.set_alias, "rule": client.set_rule, "snat": client.set_snat}
-    delete_actions = {"alias": client.del_alias, "rule": client.del_rule, "snat": client.del_snat}
-
-    for change in plan.creates:
-        create_actions[change.kind](change.payload)
-        print(f"created {change.kind}: {change.label}")
-    for change in plan.updates:
-        update_actions[change.kind](change.uuid, change.payload)
-        print(f"updated {change.kind}: {change.label}")
-    if args.prune:
-        for change in plan.unmanaged:
-            delete_actions[change.kind](change.uuid)
-            print(f"deleted {change.kind}: {change.label}")
-
-    client.apply()
-    print("Applied. HA-sync will replicate to the secondary.")
+    try:
+        run_apply(client, intent, plan, live, prune=args.prune, backup=lambda: _backup(client))
+    except ApplyAborted as aborted:
+        print(f"ABORTED: {aborted}", file=sys.stderr)
+        return 3
+    print("Applied.")
     return 0
 
 
-def cmd_backup(args) -> int:
-    client = OPNsenseClient.from_env()
+def _backup(client: OPNsenseClient) -> None:
     timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     raw_path = Path("exports/raw") / f"config-{client.host}-{timestamp}.xml"
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw_path.touch(mode=0o600)
     raw_path.write_bytes(client.download_config())
     print(f"wrote {raw_path} (raw, gitignored)")
     sanitized_path = sanitize_file(raw_path)
     print(f"wrote {sanitized_path} (sanitized, safe to commit)")
+
+
+def cmd_backup(args) -> int:
+    _backup(OPNsenseClient.from_env())
     return 0
 
 

@@ -101,3 +101,18 @@ def test_alias_content_change_detected():
     plan = plan_for(Intent(aliases=[alias]), live_aliases=live)
     (change,) = plan.updates
     assert change.changed == ["content"]
+
+
+def test_duplicate_live_key_matched_by_intent_fails():
+    # last-one-wins would leave the other duplicate "live-only", and --prune
+    # would delete it
+    import pytest
+
+    duplicate = dict(LIVE_RULE)
+    with pytest.raises(ValueError, match="duplicate live"):
+        plan_for(Intent(rules=[RULE]), live_rules={"u1": LIVE_RULE, "u2": duplicate})
+
+
+def test_duplicate_live_keys_not_in_intent_are_both_live_only():
+    plan = plan_for(Intent(), live_rules={"u1": LIVE_RULE, "u2": dict(LIVE_RULE)})
+    assert sorted(change.uuid for change in plan.unmanaged) == ["u1", "u2"]

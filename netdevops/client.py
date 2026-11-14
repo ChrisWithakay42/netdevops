@@ -1,7 +1,15 @@
-"""Thin OPNsense API client (firewall Automation endpoints + config backup).
+"""Thin OPNsense API client (firewall Automation endpoints, IP-alias VIPs,
+config backup).
 
-Only the HA primary is ever targeted: OPNsense HA-sync (XMLRPC) replicates
-aliases/rules/NAT to the secondary; pushing to both nodes would fight the sync.
+In an HA pair only the primary is ever targeted: OPNsense HA-sync (XMLRPC)
+replicates aliases/rules/NAT to the secondary; pushing to both would fight
+the sync.
+
+Every set/del is guarded. OPNsense's setRule/setItem with an unknown uuid
+silently creates a new object from model defaults (for a filter rule:
+pass any -> any on every interface), and getRule/getItem answers 200 with an
+empty or template object. So a write goes ahead only when the uuid is
+well-formed and re-reading it returns the object the caller expects.
 
 All read endpoints return the raw MVC model tree; `flatten_row` converts the
 per-field {option: {value, selected}} structures into plain strings so the
@@ -11,10 +19,17 @@ diff engine can compare live state against intent.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class WriteGuardError(RuntimeError):
+    """A write was refused because its target could not be proven to exist."""
 
 
 def _ssl_verify_from_env() -> bool | str:
@@ -90,38 +105,106 @@ class OPNsenseClient:
         snat_rules = filter_model.get("snatrules", {}).get("rule", {}) or {}
         return rules, snat_rules
 
-    # -- writes -----------------------------------------------------------
+    def get_vips(self) -> dict[str, dict]:
+        """uuid -> raw virtual IP model (all modes; callers filter)."""
+        tree = self._get("/api/interfaces/vip_settings/get")
+        return tree.get("vip", {}).get("vip", {}) or {}
 
-    def add_alias(self, payload: dict) -> None:
-        self._post("/api/firewall/alias/addItem", {"alias": payload})
+    # -- guarded writes ---------------------------------------------------
+
+    def _require_existing(
+        self, get_path: str, wrapper: str, uuid: str, key_field: str, payload: dict | None
+    ) -> None:
+        """Refuse unless `uuid` is well-formed and names a live object.
+
+        For a set, the live object's identity field must also equal the
+        payload's, so a uuid that points at a different object is refused too.
+        """
+        if not UUID_RE.match(uuid or ""):
+            raise WriteGuardError(f"refusing write: malformed uuid {uuid!r}")
+        reply = self._get(f"{get_path}/{uuid}")
+        live = reply.get(wrapper) if isinstance(reply, dict) else None
+        if not isinstance(live, dict) or not live:
+            raise WriteGuardError(f"refusing write: {get_path}/{uuid} does not exist")
+        if payload is not None:
+            live_key = flatten_row({key_field: live.get(key_field, "")})[key_field]
+            if live_key != payload.get(key_field):
+                raise WriteGuardError(
+                    f"refusing write: {uuid} is {live_key!r}, "
+                    f"expected {payload.get(key_field)!r}"
+                )
+
+    def _add(self, path: str, body: dict) -> str:
+        data = self._post(path, body)
+        uuid = data.get("uuid") if isinstance(data, dict) else None
+        if not UUID_RE.match(uuid or ""):
+            raise WriteGuardError(f"{path}: no uuid in reply {data!r}")
+        return uuid
+
+    def add_alias(self, payload: dict) -> str:
+        return self._add("/api/firewall/alias/addItem", {"alias": payload})
 
     def set_alias(self, uuid: str, payload: dict) -> None:
+        self._require_existing("/api/firewall/alias/getItem", "alias", uuid, "name", payload)
         self._post(f"/api/firewall/alias/setItem/{uuid}", {"alias": payload})
 
     def del_alias(self, uuid: str) -> None:
+        self._require_existing("/api/firewall/alias/getItem", "alias", uuid, "name", None)
         self._post(f"/api/firewall/alias/delItem/{uuid}")
 
-    def add_rule(self, payload: dict) -> None:
-        self._post("/api/firewall/filter/addRule", {"rule": payload})
+    def add_rule(self, payload: dict) -> str:
+        return self._add("/api/firewall/filter/addRule", {"rule": payload})
 
     def set_rule(self, uuid: str, payload: dict) -> None:
+        self._require_existing(
+            "/api/firewall/filter/getRule", "rule", uuid, "description", payload
+        )
         self._post(f"/api/firewall/filter/setRule/{uuid}", {"rule": payload})
 
     def del_rule(self, uuid: str) -> None:
+        self._require_existing("/api/firewall/filter/getRule", "rule", uuid, "description", None)
         self._post(f"/api/firewall/filter/delRule/{uuid}")
 
-    def add_snat(self, payload: dict) -> None:
-        self._post("/api/firewall/source_nat/addRule", {"rule": payload})
+    def add_snat(self, payload: dict) -> str:
+        return self._add("/api/firewall/source_nat/addRule", {"rule": payload})
 
     def set_snat(self, uuid: str, payload: dict) -> None:
+        self._require_existing(
+            "/api/firewall/source_nat/getRule", "rule", uuid, "description", payload
+        )
         self._post(f"/api/firewall/source_nat/setRule/{uuid}", {"rule": payload})
 
     def del_snat(self, uuid: str) -> None:
+        self._require_existing(
+            "/api/firewall/source_nat/getRule", "rule", uuid, "description", None
+        )
         self._post(f"/api/firewall/source_nat/delRule/{uuid}")
 
-    def apply(self) -> None:
-        """Activate pending alias + rule changes."""
+    def add_vip(self, payload: dict) -> str:
+        return self._add("/api/interfaces/vip_settings/addItem", {"vip": payload})
+
+    def set_vip(self, uuid: str, payload: dict) -> None:
+        self._require_existing(
+            "/api/interfaces/vip_settings/getItem", "vip", uuid, "network", payload
+        )
+        self._post(f"/api/interfaces/vip_settings/setItem/{uuid}", {"vip": payload})
+
+    def del_vip(self, uuid: str) -> None:
+        self._require_existing(
+            "/api/interfaces/vip_settings/getItem", "vip", uuid, "network", None
+        )
+        self._post(f"/api/interfaces/vip_settings/delItem/{uuid}")
+
+    # -- activation -------------------------------------------------------
+
+    def reconfigure_aliases(self) -> None:
         self._post("/api/firewall/alias/reconfigure")
+
+    def reconfigure_vips(self) -> None:
+        self._post("/api/interfaces/vip_settings/reconfigure")
+
+    def apply_filter(self) -> None:
+        """Load the saved filter + source NAT rules into pf."""
         self._post("/api/firewall/filter/apply")
 
     # -- backup -----------------------------------------------------------

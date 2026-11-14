@@ -9,7 +9,7 @@ import yaml
 from .models import Intent
 
 # A file may carry more than one section (interfaces.yml also holds vips).
-KNOWN_KEYS = {"aliases", "rules", "snat_rules", "interfaces", "vips"}
+KNOWN_KEYS = {"aliases", "rules", "snat_rules", "interfaces", "vips", "virtual_ips"}
 
 
 def load_intent(directory: str | Path = "network") -> Intent:
