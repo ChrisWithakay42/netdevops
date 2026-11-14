@@ -391,3 +391,42 @@ def test_rollback_ignores_a_second_ctrl_c():
     with pytest.raises(KeyboardInterrupt):
         apply(firewall, Intent(virtual_ips=[DNS_VIP], rules=[RULE]))
     assert firewall.store["vip"] == {}
+
+
+def test_rollback_runs_off_the_main_thread():
+    import threading
+
+    firewall = FakeFirewall()
+    firewall.fail_on = "add_rule"
+    outcome = {}
+
+    def worker():
+        try:
+            apply(firewall, Intent(virtual_ips=[DNS_VIP], rules=[RULE]))
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert isinstance(outcome["error"], ApplyAborted)
+    assert firewall.store["vip"] == {}
+
+
+def test_unrecorded_rule_via_rolled_back_any_alias_is_still_removed():
+    firewall = FakeFirewall()
+    everything = Alias(name="EVERYTHING", type="network", content=["10.0.0.0/8", "0.0.0.0/0"])
+
+    def spawn_rogue_then_interrupt(fw):
+        # fires on the VIP write: EVERYTHING is already created and recorded,
+        # so rollback deletes it before classifying unrecorded rules
+        if fw.store["vip"] and ROGUE_UUID not in fw.store["rule"]:
+            fw.store["rule"][ROGUE_UUID] = dict(ROGUE, destination_net="EVERYTHING")
+            raise KeyboardInterrupt
+
+    firewall.after_write = spawn_rogue_then_interrupt
+    # an intent alias meaning "any" is fine on its own (no rule uses it)
+    with pytest.raises(KeyboardInterrupt):
+        apply(firewall, Intent(aliases=[everything], virtual_ips=[DNS_VIP]))
+    assert firewall.store["alias"] == {}
+    assert ROGUE_UUID not in firewall.store["rule"]

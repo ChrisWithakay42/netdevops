@@ -23,6 +23,7 @@ from the backup.
 from __future__ import annotations
 
 import signal
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -158,6 +159,12 @@ def _rollback(client, intent, before, journal, echo) -> list[str]:
     """Undo in reverse dependency order: per kind, restore updates, then delete
     creates, so a rule stops referencing a new alias before the alias goes."""
     failures = []
+    # Aliases that meant "any" while the rules were being written; the
+    # restores below may delete them, which would hide an any-any rule.
+    try:
+        written_any_aliases = any_aliases(fetch_live(client).aliases)
+    except Exception:
+        written_any_aliases = set()
     for kind in reversed(KINDS):
         for update_kind, change in reversed(journal.updated):
             if update_kind != kind:
@@ -187,7 +194,9 @@ def _rollback(client, intent, before, journal, echo) -> list[str]:
     for kind in KINDS:
         unrecorded = set(now.of(kind)) - set(before.of(kind)) - journal.created[kind]
         if kind == "rule":
-            for uuid in sorted(set(_pass_all(intent, now)) & unrecorded):
+            means_any = written_any_aliases | any_aliases(before.aliases) | any_aliases(now.aliases)
+            pass_all = pass_all_rules(now.rules, _approved_any_any(intent), means_any)
+            for uuid in sorted(set(pass_all) & unrecorded):
                 try:
                     client.del_rule(uuid)
                     unrecorded.discard(uuid)
@@ -234,12 +243,16 @@ def run_apply(
         _write(client, plan, prune, journal, echo)
         _check(client, intent, before, journal, echo)
     except BaseException as error:  # Ctrl-C too: never leave a half-written config saved
-        # a second Ctrl-C must not cut the rollback short
-        previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # a second Ctrl-C must not cut the rollback short (main thread only;
+        # elsewhere signal.signal raises, and the rollback must still run)
+        previous_handler = None
+        if threading.current_thread() is threading.main_thread():
+            previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             failures = _rollback(client, intent, before, journal, echo)
         finally:
-            signal.signal(signal.SIGINT, previous_handler)
+            if previous_handler is not None:
+                signal.signal(signal.SIGINT, previous_handler)
         detail = "; ".join(failures) if failures else "all writes undone"
         if not isinstance(error, Exception):
             echo(f"interrupted; rolled back this run's writes ({detail})")
