@@ -360,3 +360,34 @@ def test_rollback_restores_references_before_deleting_aliases():
         apply(firewall, intent)
     assert firewall.store["alias"] == {}
     assert firewall.store["rule"][rule_uuid]["destination_net"] == "any"
+
+
+def test_unrecorded_pass_all_rule_is_removed_on_rollback():
+    firewall = FakeFirewall()
+
+    def spawn_rogue_then_interrupt(fw):
+        fw.store["rule"].setdefault(ROGUE_UUID, dict(ROGUE))
+        raise KeyboardInterrupt
+
+    firewall.after_write = spawn_rogue_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        apply(firewall, Intent(virtual_ips=[DNS_VIP]))
+    assert ROGUE_UUID not in firewall.store["rule"]
+
+
+def test_rollback_ignores_a_second_ctrl_c():
+    import os
+    import signal
+
+    firewall = FakeFirewall()
+    firewall.fail_on, firewall.fail_with = "add_rule", KeyboardInterrupt
+    original_del = firewall._del
+
+    def impatient_user(kind, uuid):
+        os.kill(os.getpid(), signal.SIGINT)  # pressed again during rollback
+        original_del(kind, uuid)
+
+    firewall._del = impatient_user
+    with pytest.raises(KeyboardInterrupt):
+        apply(firewall, Intent(virtual_ips=[DNS_VIP], rules=[RULE]))
+    assert firewall.store["vip"] == {}

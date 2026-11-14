@@ -22,6 +22,7 @@ from the backup.
 
 from __future__ import annotations
 
+import signal
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -153,7 +154,7 @@ def _check(client, intent, before, journal, echo) -> None:
         raise ApplyAborted("; ".join(problems))
 
 
-def _rollback(client, before, journal, echo) -> list[str]:
+def _rollback(client, intent, before, journal, echo) -> list[str]:
     """Undo in reverse dependency order: per kind, restore updates, then delete
     creates, so a rule stops referencing a new alias before the alias goes."""
     failures = []
@@ -177,14 +178,22 @@ def _rollback(client, before, journal, echo) -> list[str]:
         for uuid in sorted(journal.deleted[kind]):
             failures.append(f"pruned {kind} {uuid} is gone; restore it from the backup")
     # An add the firewall saved but whose reply never reached us (Ctrl-C,
-    # timeout) isn't in the journal. Report it; it can't be told apart from a
-    # concurrent GUI edit, so it is not deleted.
+    # timeout) isn't in the journal. It can't be told apart from a concurrent
+    # GUI edit, so it is reported, unless it has the pass-all signature.
     try:
         now = fetch_live(client)
     except Exception as error:
         return failures + [f"could not re-read live state after rollback: {error}"]
     for kind in KINDS:
         unrecorded = set(now.of(kind)) - set(before.of(kind)) - journal.created[kind]
+        if kind == "rule":
+            for uuid in sorted(set(_pass_all(intent, now)) & unrecorded):
+                try:
+                    client.del_rule(uuid)
+                    unrecorded.discard(uuid)
+                    echo(f"removed unrecorded pass-all rule {uuid}")
+                except Exception as error:
+                    failures.append(f"delete pass-all rule {uuid}: {error}")
         if unrecorded:
             failures.append(
                 f"unrecorded new {kind} object(s) {sorted(unrecorded)} are saved; "
@@ -225,7 +234,12 @@ def run_apply(
         _write(client, plan, prune, journal, echo)
         _check(client, intent, before, journal, echo)
     except BaseException as error:  # Ctrl-C too: never leave a half-written config saved
-        failures = _rollback(client, before, journal, echo)
+        # a second Ctrl-C must not cut the rollback short
+        previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            failures = _rollback(client, intent, before, journal, echo)
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
         detail = "; ".join(failures) if failures else "all writes undone"
         if not isinstance(error, Exception):
             echo(f"interrupted; rolled back this run's writes ({detail})")
