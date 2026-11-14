@@ -8,7 +8,7 @@ the sync.
 Every set/del is guarded. OPNsense's setRule/setItem with an unknown uuid
 silently creates a new object from model defaults (for a filter rule:
 pass any -> any on every interface), and getRule/getItem answers 200 with an
-or template object (on 26.7, alias/getItem/<unknown> returns a populated
+empty or template object (on 26.7, alias/getItem/<unknown> returns a populated
 template). So a write goes ahead only when the uuid is well-formed and the
 bulk listing (alias/get, filter/get, vip_settings/get) holds it with the
 identity the caller expects.

@@ -9,7 +9,9 @@ live. So the flow is:
 2. Write all kinds: aliases, IP-alias VIPs, filter rules, source NAT. Aliases
    first because rules reference them.
 3. Re-read everything. Abort if an object appeared that this run did not
-   create, or the saved ruleset holds an unapproved pass any -> any rule.
+   create, the saved ruleset holds an unapproved pass any -> any rule, or a
+   re-plan of the touched kinds is not empty (a write that didn't land as
+   intended, e.g. a field the API normalised).
 4. Activate only the kinds that changed.
 
 Any failure in steps 2-3 undoes this run's own writes from the pre-images
@@ -148,9 +150,19 @@ def _check(client, intent, before, journal, echo) -> None:
             f"stray {kind} object(s) appeared during the writes: "
             f"removed pass-all {sorted(pass_all_strays)}, left in place {left}"
         )
-    offenders = _pass_all(intent, fetch_live(client)) if not problems else []
-    if offenders:
-        problems.append(f"enabled pass any -> any rule(s) {offenders} in the saved ruleset")
+    if not problems:
+        offenders = _pass_all(intent, after)
+        if offenders:
+            problems.append(f"enabled pass any -> any rule(s) {offenders} in the saved ruleset")
+        # what was written must now read back as exactly the intent
+        replan = plan_from_live(intent, after)
+        drift = [
+            f"{change.kind} {change.label} ({', '.join(change.changed) or 'missing'})"
+            for change in replan.creates + replan.updates
+            if change.kind in journal.touched()
+        ]
+        if drift:
+            problems.append(f"writes did not land as intended: {drift}")
     if problems:
         raise ApplyAborted("; ".join(problems))
 

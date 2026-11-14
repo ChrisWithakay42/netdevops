@@ -430,3 +430,22 @@ def test_unrecorded_rule_via_rolled_back_any_alias_is_still_removed():
         apply(firewall, Intent(aliases=[everything], virtual_ips=[DNS_VIP]))
     assert firewall.store["alias"] == {}
     assert ROGUE_UUID not in firewall.store["rule"]
+
+
+def test_writes_that_did_not_land_as_intended_are_rolled_back_not_activated():
+    # e.g. the API silently normalising a field: a permanent "update" on every
+    # plan, and something live that the intent never asked for
+    firewall = FakeFirewall()
+    original_row = firewall._row
+
+    def normalising_row(kind, payload):
+        row = original_row(kind, payload)
+        if kind == "vip":
+            row["interface"] = "lan"
+        return row
+
+    firewall._row = normalising_row
+    with pytest.raises(ApplyAborted, match="did not land"):
+        apply(firewall, Intent(virtual_ips=[DNS_VIP]))
+    assert firewall.store["vip"] == {}
+    assert activated(firewall) == []
