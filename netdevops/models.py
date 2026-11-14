@@ -128,6 +128,9 @@ class VirtualIP(BaseModel):
     address: str  # CIDR, e.g. 10.20.0.53/32; the match key
     interface: str
     description: str = ""
+    # keep OPNsense services (webGUI, sshd, ntpd, unbound) from listening on
+    # it; lo0 addresses are otherwise always bound
+    nobind: bool = False
 
     @field_validator("address")
     @classmethod

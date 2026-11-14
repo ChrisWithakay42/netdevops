@@ -132,6 +132,7 @@ def parse_export(path: str | Path) -> Intent:
                         address=f"{subnet}/{_text(vip_element, 'subnet_bits') or '32'}",
                         interface=_text(vip_element, "interface"),
                         description=_text(vip_element, "descr"),
+                        nobind=_flag(vip_element, "nobind"),
                     )
                 )
 

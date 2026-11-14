@@ -97,6 +97,7 @@ def vip_payload(vip: VirtualIP) -> dict:
         "interface": vip.interface,
         "network": vip.address,
         "descr": vip.description,
+        "nobind": _API_BOOL[vip.nobind],
     }
 
 
